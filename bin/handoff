@@ -491,16 +491,20 @@ cmd_setup(){
   [ -z "$REMOTE_ROOT" ] && REMOTE_ROOT="$root"
 
   mkdir -p "$(dirname "$CONFIG")" "$STATE_DIR" "$BACKUPS"
+  # Single quotes matter: paths may contain $HOME, which must be expanded by
+  # the REMOTE shell, not by this one when the config is sourced.
   cat > "$CONFIG" <<EOF
 # handoff configuration. Regenerate with 'handoff setup'.
-HANDOFF_HOST="$HOST"
-HANDOFF_REMOTE_ROOT="$REMOTE_ROOT"
-HANDOFF_REMOTE_KIND="$REMOTE_KIND"
-HANDOFF_WSL_DISTRO="$WSL_DISTRO"
-HANDOFF_REMOTE_LABEL="$REMOTE_LABEL"
-HANDOFF_CLAUDE_BIN="$CLAUDE_BIN"
-HANDOFF_PERMISSION_MODE="${PERMISSION_MODE}"
-HANDOFF_SESSION_PREFIX="${SESSION_PREFIX}"
+# Values are single quoted so \$HOME stays literal and expands on the remote.
+HANDOFF_HOST='$HOST'
+HANDOFF_REMOTE_ROOT='$REMOTE_ROOT'
+HANDOFF_REMOTE_KIND='$REMOTE_KIND'
+HANDOFF_WSL_DISTRO='$WSL_DISTRO'
+HANDOFF_REMOTE_LABEL='$REMOTE_LABEL'
+HANDOFF_CLAUDE_BIN='$CLAUDE_BIN'
+HANDOFF_PERMISSION_MODE='${PERMISSION_MODE}'
+HANDOFF_SESSION_PREFIX='${SESSION_PREFIX}'
+HANDOFF_CONFIRM_SIZE_MB='${CONFIRM_SIZE_MB}'
 EOF
   ok "config written to $CONFIG"
 

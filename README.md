@@ -144,17 +144,20 @@ local `.git` pointer file is never written to.
 
 `~/.config/handoff/config` is plain shell, written by `handoff setup`:
 
+Values are single quoted on purpose. A path containing `$HOME` must be expanded by the
+remote shell, not by yours when the config is sourced.
+
 ```sh
-HANDOFF_HOST="you@homelab"            # anything ssh understands
-HANDOFF_REMOTE_ROOT="/home/you/work"  # where projects land
-HANDOFF_REMOTE_KIND="plain"           # plain | wsl
-HANDOFF_WSL_DISTRO="Ubuntu"           # only for kind=wsl
-HANDOFF_REMOTE_LABEL="homelab"        # what to call it in messages
-HANDOFF_CLAUDE_BIN="$HOME/.local/bin/claude"
-HANDOFF_PERMISSION_MODE="auto"        # auto | acceptEdits | bypassPermissions | plan
-HANDOFF_SESSION_PREFIX="hand-"
-HANDOFF_CONFIRM_SIZE_MB="100"         # prompt above this transfer size
-HANDOFF_CONNECT_TRIES="3"             # SSH attempts before giving up
+HANDOFF_HOST='you@homelab'            # anything ssh understands
+HANDOFF_REMOTE_ROOT='/home/you/work'  # where projects land
+HANDOFF_REMOTE_KIND='plain'           # plain | wsl
+HANDOFF_WSL_DISTRO='Ubuntu'           # only for kind=wsl
+HANDOFF_REMOTE_LABEL='homelab'        # what to call it in messages
+HANDOFF_CLAUDE_BIN='$HOME/.local/bin/claude'
+HANDOFF_PERMISSION_MODE='auto'        # auto | acceptEdits | bypassPermissions | plan
+HANDOFF_SESSION_PREFIX='hand-'
+HANDOFF_CONFIRM_SIZE_MB='100'         # prompt above this transfer size
+HANDOFF_CONNECT_TRIES='3'             # SSH attempts before giving up
 ```
 
 Per project, a `.handoffignore` file in the project root is passed to rsync as
@@ -200,8 +203,9 @@ logs in unless you run `tailscale set --unattended=true`.
   `handoff back` overwrites your edits, recoverable only from the snapshot.
 - Branches created on the remote are not synced back. The checked-out branch is.
 - `handoff back` uses `rsync --delete`. It snapshots first, but be aware.
-- Tested against a macOS client and a Windows/WSL remote. Other combinations should work
-  and have not been proven.
+- Proven against a macOS client with a Windows/WSL remote: full round trips including
+  worktrees. For `plain` remotes the command plumbing and `handoff doctor` are verified,
+  but a full session start has not been exercised end to end. Reports welcome.
 
 ## License
 
