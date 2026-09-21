@@ -440,10 +440,18 @@ cmd_abort(){
 
 # --- setup ----------------------------------------------------------------
 ask(){ # ask <prompt> <default> -> echoes answer
+  # Prefer the terminal so prompts still work when stdin is a pipe, but fall
+  # back to stdin when there is no tty, which keeps setup scriptable.
   local prompt="$1" def="${2:-}" ans
   if [ -n "$def" ]; then printf "  %s [%s]: " "$prompt" "$def" >&2
   else printf "  %s: " "$prompt" >&2; fi
-  read -r ans </dev/tty
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    read -r ans <&3 || ans=""
+    exec 3<&-
+  else
+    read -r ans || ans=""
+    printf "%s\n" "${ans:-$def}" >&2
+  fi
   echo "${ans:-$def}"
 }
 
