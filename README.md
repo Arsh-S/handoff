@@ -48,13 +48,36 @@ Run `handoff doctor` any time to check both ends.
 
 | | |
 |---|---|
-| `handoff to remote` | push this project and start Claude over there |
+| `handoff to remote [-y]` | push this project and start Claude over there |
 | `handoff back` | pull it home and stop the remote session |
 | `handoff status` | what is out, and is the remote up |
 | `handoff attach` | attach to the remote tmux session over SSH |
 | `handoff port <n>` | forward a dev server port from the remote |
 | `handoff abort` | release the lock without syncing back |
 | `handoff doctor` | health check both machines |
+
+### Before it sends anything
+
+Two checks run before the first byte moves.
+
+**It refuses a directory that is not a git repository**, which is almost always a sign
+you are one level above the project you meant. Confirm, or pass `-y`.
+
+**It prints the transfer size and asks if it is large.** For a worktree that includes the
+shared object store, which is usually the bigger half. The threshold is
+`HANDOFF_CONFIRM_SIZE_MB`, default 100.
+
+```
+==> Transfer size
+  working files:    41.2MB
+  git object store: 380.6MB
+  total:            421.8MB
+  [!!] that is over the 100MB confirmation threshold
+  Send 421.8MB to homelab? [y/N]:
+```
+
+Neither prompt will hang a script: with no terminal and no `-y`, handoff stops rather
+than guessing.
 
 ## Requirements
 
@@ -130,6 +153,8 @@ HANDOFF_REMOTE_LABEL="homelab"        # what to call it in messages
 HANDOFF_CLAUDE_BIN="$HOME/.local/bin/claude"
 HANDOFF_PERMISSION_MODE="auto"        # auto | acceptEdits | bypassPermissions | plan
 HANDOFF_SESSION_PREFIX="hand-"
+HANDOFF_CONFIRM_SIZE_MB="100"         # prompt above this transfer size
+HANDOFF_CONNECT_TRIES="3"             # SSH attempts before giving up
 ```
 
 Per project, a `.handoffignore` file in the project root is passed to rsync as
