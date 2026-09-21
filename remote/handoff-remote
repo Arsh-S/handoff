@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# handoff-remote - the half of handoff that runs on the remote machine.
+# Installed to ~/.local/bin/handoff-remote by `handoff setup`.
+#
+#   prep <dir>      make <dir>/.git safe to receive a real git directory
+#   finalize <dir>  turn a synced worktree into a standalone repository
+#   info <dir>      print branch= and head= for the repo at <dir>
+#   trust <dir>     pre-accept Claude Code's folder-trust prompt for <dir>
+#
+# https://github.com/Arsh-S/handoff   MIT licensed.
+set -uo pipefail
+
+cmd="${1:-}"; dir="${2:-}"
+if [ -z "$cmd" ] || [ -z "$dir" ]; then
+  echo "usage: handoff-remote {prep|finalize|info|trust} <dir>" >&2; exit 1
+fi
+
+trust(){
+  # Claude Code asks "do you trust this folder?" on first run in a new
+  # directory, which blocks an unattended session. Mark it accepted.
+  local target="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$target" <<'PY'
+import json, os, sys
+d = os.path.abspath(sys.argv[1])
+f = os.path.join(os.path.expanduser("~"), ".claude.json")
+try:
+    j = json.load(open(f))
+except Exception:
+    j = {}
+j.setdefault("projects", {})
+entry = j["projects"].get(d, {})
+entry["hasTrustDialogAccepted"] = True
+j["projects"][d] = entry
+if os.path.exists(f):
+    try: __import__("shutil").copyfile(f, f + ".bak")
+    except Exception: pass
+json.dump(j, open(f, "w"), indent=2)
+print("trusted: " + d)
+PY
+  elif command -v node >/dev/null 2>&1; then
+    node -e '
+const fs=require("fs"),os=require("os"),p=require("path");
+const d=p.resolve(process.argv[1]); const f=p.join(os.homedir(),".claude.json");
+let j={}; try{j=JSON.parse(fs.readFileSync(f,"utf8"));}catch(e){}
+j.projects=j.projects||{};
+j.projects[d]=Object.assign({},j.projects[d],{hasTrustDialogAccepted:true});
+try{if(fs.existsSync(f))fs.copyFileSync(f,f+".bak");}catch(e){}
+fs.writeFileSync(f,JSON.stringify(j,null,2));
+console.log("trusted: "+d);' "$target"
+  else
+    echo "neither python3 nor node found; cannot pre-trust the folder" >&2
+    exit 1
+  fi
+}
+
+case "$cmd" in
+  trust)
+    trust "$dir"
+    ;;
+
+  prep)
+    cd "$dir" 2>/dev/null || { echo "no such dir: $dir" >&2; exit 1; }
+    # An earlier sync may have left .git as a worktree pointer FILE. rsync
+    # cannot replace a file with a directory, so move it aside. Never delete.
+    if [ -f .git ]; then mv .git ".git.stashed-by-handoff.$(date +%s)"; fi
+    mkdir -p .git
+    echo "prepped"
+    ;;
+
+  finalize)
+    cd "$dir" 2>/dev/null || { echo "no such dir: $dir" >&2; exit 1; }
+    # Worktree metadata points at paths on the other machine. Stash it so this
+    # copy behaves as an ordinary repository.
+    if [ -d .git/worktrees ]; then
+      mv .git/worktrees ".git/worktrees.stashed-by-handoff.$(date +%s)"
+    fi
+    git config --unset core.worktree 2>/dev/null
+    git config core.bare false
+    # HEAD and index arrived from the worktree and already agree. Do NOT run
+    # `git reset` here: it would unstage everything staged on the other side.
+    echo "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    echo "head=$(git rev-parse HEAD 2>/dev/null)"
+    git status --short | head -5
+    ;;
+
+  info)
+    cd "$dir" 2>/dev/null || { echo "no such dir: $dir" >&2; exit 1; }
+    b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ "$b" = "HEAD" ] && b="DETACHED"
+    echo "branch=$b"
+    echo "head=$(git rev-parse HEAD 2>/dev/null)"
+    ;;
+
+  *) echo "unknown command: $cmd" >&2; exit 1 ;;
+esac

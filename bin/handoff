@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+#
+# handoff - move a project to another machine, work on it there, bring it back.
+#
+# Files live in exactly one place at a time. While a project is on the remote,
+# a Claude Code hook stops the local machine from editing the stale copy.
+#
+# https://github.com/Arsh-S/handoff   MIT licensed.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# --- configuration --------------------------------------------------------
+CONFIG="${HANDOFF_CONFIG:-$HOME/.config/handoff/config}"
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+HOST="${HANDOFF_HOST:-}"                        # user@host, as ssh understands it
+REMOTE_ROOT="${HANDOFF_REMOTE_ROOT:-}"          # where projects land, e.g. /home/you/work
+REMOTE_KIND="${HANDOFF_REMOTE_KIND:-plain}"     # plain | wsl
+WSL_DISTRO="${HANDOFF_WSL_DISTRO:-Ubuntu}"      # only used when REMOTE_KIND=wsl
+REMOTE_LABEL="${HANDOFF_REMOTE_LABEL:-$HOST}"   # what to call it in messages
+PERMISSION_MODE="${HANDOFF_PERMISSION_MODE:-auto}"
+SESSION_PREFIX="${HANDOFF_SESSION_PREFIX:-hand-}"
+CLAUDE_BIN="${HANDOFF_CLAUDE_BIN:-\$HOME/.local/bin/claude}"
+SSH_OPTS="${HANDOFF_SSH_OPTS:--o ConnectTimeout=20}"
+
+STATE_DIR="${HANDOFF_STATE_DIR:-$HOME/.handoff}"
+REG="$STATE_DIR/handoffs.json"
+BACKUPS="$STATE_DIR/backups"
+
+# Directories never worth copying. Override per project with .handoffignore.
+IGNORE_DEFAULT=(node_modules .venv venv env __pycache__ .pytest_cache .mypy_cache
+  .next .nuxt .svelte-kit .turbo .parcel-cache .expo .expo-shared
+  dist build target out coverage .gradle Pods DerivedData
+  .DS_Store '*.log' '*.pyc' .terraform .serverless tmp .cache)
+
+c_r=$'\033[31m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_b=$'\033[34m'; c_0=$'\033[0m'
+die(){  printf "%shandoff:%s %s\n" "$c_r" "$c_0" "$*" >&2; exit 1; }
+say(){  printf "%s==>%s %s\n" "$c_b" "$c_0" "$*"; }
+ok(){   printf "  %s[ok]%s %s\n" "$c_g" "$c_0" "$*"; }
+warn(){ printf "  %s[!!]%s %s\n" "$c_y" "$c_0" "$*"; }
+py(){ python3 "$@"; }
+
+need_config(){
+  [ -n "$HOST" ] || die "no remote configured. Run 'handoff setup' first."
+  [ -n "$REMOTE_ROOT" ] || die "HANDOFF_REMOTE_ROOT is unset. Run 'handoff setup'."
+  mkdir -p "$STATE_DIR" "$BACKUPS"
+}
+
+# --- talking to the remote ------------------------------------------------
+# On WSL the ssh session lands in cmd.exe, so every command is wrapped in
+# `wsl -d <distro> -- bash -lc "..."`. Keep remote commands free of double
+# quotes; single quotes survive both layers.
+rexec(){
+  local cmd="$1"
+  if [ "$REMOTE_KIND" = "wsl" ]; then
+    ssh $SSH_OPTS "$HOST" "wsl -d $WSL_DISTRO -- bash -lc \"$cmd\""
+  else
+    ssh $SSH_OPTS "$HOST" "bash -lc \"$cmd\""
+  fi
+}
+
+# rsync needs to reach the same shell. On WSL that means --rsync-path.
+rsync_remote(){
+  if [ "$REMOTE_KIND" = "wsl" ]; then
+    rsync -e "ssh $SSH_OPTS" --rsync-path="wsl -d $WSL_DISTRO -- rsync" "$@"
+  else
+    rsync -e "ssh $SSH_OPTS" "$@"
+  fi
+}
+
+require_remote(){
+  say "Checking $REMOTE_LABEL"
+  rexec "true" >/dev/null 2>&1 || die "cannot reach $HOST. Is it awake and on the network?"
+  ok "reachable"
+}
+
+# --- registry -------------------------------------------------------------
+reg_get(){
+  py - "$REG" "$1" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+v=d.get(sys.argv[2])
+if v: print(json.dumps(v))
+PY
+}
+reg_set(){
+  py - "$REG" "$1" "$2" <<'PY'
+import json,sys,os
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+d[sys.argv[2]]=json.loads(sys.argv[3])
+os.makedirs(os.path.dirname(sys.argv[1]),exist_ok=True)
+json.dump(d,open(sys.argv[1],'w'),indent=2)
+PY
+}
+reg_del(){
+  py - "$REG" "$1" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+d.pop(sys.argv[2],None)
+json.dump(d,open(sys.argv[1],'w'),indent=2)
+PY
+}
+reg_field(){ echo "$1" | py -c "import json,sys;print(json.load(sys.stdin).get('$2',''))"; }
+
+project_root(){ git rev-parse --show-toplevel 2>/dev/null || pwd -P; }
+
+build_excludes(){   # fills the global EX array (bash 3.2 has no mapfile)
+  local p
+  EX=()
+  for p in "${IGNORE_DEFAULT[@]}"; do EX+=(--exclude="$p"); done
+  [ -f "$ROOT/.handoffignore" ] && EX+=(--exclude-from="$ROOT/.handoffignore")
+}
+
+snapshot(){
+  local name ts tgz
+  name="$(basename "$1")"; ts="$(date +%Y%m%d-%H%M%S)"
+  tgz="$BACKUPS/${name}-$2-${ts}.tar.gz"
+  mkdir -p "$BACKUPS"
+  tar czf "$tgz" -C "$(dirname "$1")" \
+      --exclude=node_modules --exclude=.venv --exclude=venv \
+      --exclude=__pycache__ --exclude=.next --exclude=dist --exclude=build \
+      --exclude=target --exclude=Pods --exclude=DerivedData \
+      "$name" 2>/dev/null
+  echo "$tgz"
+}
+
+# --- git layout -----------------------------------------------------------
+# A worktree's .git is a FILE holding an absolute path into the parent repo.
+# That path is meaningless on the remote, so worktrees need special handling.
+detect_git(){
+  IS_GIT=0; IS_WORKTREE=0; GIT_COMMON=""; GIT_DIR_ABS=""; BRANCH=""
+  git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  IS_GIT=1
+  GIT_DIR_ABS="$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null)"
+  GIT_COMMON="$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null)"
+  case "$GIT_COMMON" in /*) ;; *) GIT_COMMON="$ROOT/$GIT_COMMON" ;; esac
+  GIT_COMMON="$(cd "$GIT_COMMON" 2>/dev/null && pwd -P)"
+  BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [ -n "$GIT_DIR_ABS" ] && [ -n "$GIT_COMMON" ] && [ "$GIT_DIR_ABS" != "$GIT_COMMON" ] && IS_WORKTREE=1
+  return 0
+}
+
+# --- commands -------------------------------------------------------------
+cmd_to(){
+  need_config
+  ROOT="$(project_root)"
+  local name existing remote
+  name="$(basename "$ROOT")"
+  existing="$(reg_get "$ROOT")"
+  [ -n "$existing" ] && die "$name is already handed off. See 'handoff status', or 'handoff back'."
+  remote="$REMOTE_ROOT/$name"
+
+  detect_git
+  require_remote
+  say "Handing off $name"
+  echo "  local :  $ROOT"
+  echo "  remote:  $HOST:$remote"
+  if [ "$IS_GIT" = 1 ]; then
+    local dirty; dirty="$(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ')"
+    if [ "$IS_WORKTREE" = 1 ]; then
+      echo "  git   :  worktree on branch $BRANCH, $dirty uncommitted change(s)"
+      echo "           the shared object store travels too, so git works over there"
+    else
+      echo "  git   :  branch $BRANCH, $dirty uncommitted change(s) coming along"
+    fi
+  fi
+
+  build_excludes
+  rexec "mkdir -p '$remote'" >/dev/null 2>&1
+
+  if [ "$IS_WORKTREE" = 1 ]; then
+    say "Syncing working files"
+    rsync_remote -az --delete "${EX[@]}" --exclude='.git' \
+      "$ROOT/" "$HOST:$remote/" >/dev/null || die "rsync of working files failed"
+    ok "working files synced"
+
+    say "Materialising a real .git on the remote"
+    rexec "\$HOME/.local/bin/handoff-remote prep '$remote'" >/dev/null 2>&1
+    rsync_remote -az --delete \
+      --exclude='worktrees' --exclude='worktrees.stashed-by-handoff.*' --exclude='index' \
+      "$GIT_COMMON/" "$HOST:$remote/.git/" >/dev/null || die "rsync of the git dir failed"
+    local xfer=("$GIT_DIR_ABS/HEAD")
+    [ -f "$GIT_DIR_ABS/index" ] && xfer+=("$GIT_DIR_ABS/index")
+    rsync_remote -az "${xfer[@]}" "$HOST:$remote/.git/" >/dev/null || die "could not ship HEAD/index"
+    rexec "\$HOME/.local/bin/handoff-remote finalize '$remote'" 2>/dev/null | tr -d '\r' | sed 's/^/    /'
+    ok "standalone repo on branch $BRANCH"
+  else
+    say "Syncing to the remote"
+    rsync_remote -az --delete "${EX[@]}" \
+      "$ROOT/" "$HOST:$remote/" >/dev/null || die "rsync to the remote failed"
+    ok "files synced"
+  fi
+
+  say "Pre-accepting Claude's folder-trust prompt"
+  rexec "\$HOME/.local/bin/handoff-remote trust '$remote'" >/dev/null 2>&1 \
+    && ok "folder trusted, so the session can start unattended" \
+    || warn "could not pre-trust the folder; the session may sit on the trust prompt"
+
+  local sess="$SESSION_PREFIX$name"
+  say "Starting Claude on the remote (session '$sess')"
+  rexec "tmux has-session -t $sess 2>/dev/null && tmux kill-session -t $sess; tmux new-session -d -s $sess -x 200 -y 50 -c '$remote' '$CLAUDE_BIN --remote-control $sess --permission-mode $PERMISSION_MODE; exec bash'" >/dev/null 2>&1 \
+    || warn "could not start the tmux session; run 'handoff attach' and start it yourself"
+
+  reg_set "$ROOT" "$(py - "$remote" "$sess" "$HOST" "$IS_WORKTREE" "$GIT_COMMON" "$GIT_DIR_ABS" "$BRANCH" <<'PY'
+import json,sys,datetime
+print(json.dumps({"remote":sys.argv[1],"session":sys.argv[2],"host":sys.argv[3],
+                  "worktree":sys.argv[4]=="1","git_common":sys.argv[5],
+                  "git_dir":sys.argv[6],"branch":sys.argv[7],
+                  "since":datetime.datetime.now().isoformat(timespec='seconds')}))
+PY
+)"
+  ok "registered: this machine will now refuse to edit $name"
+  echo
+  echo "  Pick it up in the Claude app under '$sess', or run 'handoff attach'."
+  echo "  Dev server over there?  handoff port 3000"
+  echo "  Finished?               handoff back"
+}
+
+cmd_back(){
+  need_config
+  ROOT="$(project_root)"
+  local name info remote sess wt gcommon gdir branch force=0
+  [ "${1:-}" = "--force" ] && force=1
+  name="$(basename "$ROOT")"
+  info="$(reg_get "$ROOT")" || true
+  [ -z "$info" ] && die "$name is not handed off."
+  remote="$(reg_field "$info" remote)"
+  sess="$(reg_field "$info" session)"
+  gcommon="$(reg_field "$info" git_common)"
+  gdir="$(reg_field "$info" git_dir)"
+  branch="$(reg_field "$info" branch)"
+  wt="$(echo "$info" | py -c 'import json,sys;print("1" if json.load(sys.stdin).get("worktree") else "0")')"
+
+  require_remote
+  say "Bringing $name back"
+
+  if [ $force -eq 0 ] && rexec "tmux has-session -t $sess 2>/dev/null" >/dev/null 2>&1; then
+    warn "the remote session $sess is still running and will be stopped."
+    warn "Ctrl-C now if you want to look at it first."
+    sleep 4
+  fi
+
+  local snap; snap="$(snapshot "$ROOT" pre-back)"
+  ok "local snapshot saved: $snap"
+  build_excludes
+
+  if [ "$wt" = "1" ]; then
+    local pcinfo head
+    pcinfo="$(rexec "\$HOME/.local/bin/handoff-remote info '$remote'" 2>/dev/null | tr -d '\r')"
+    head="$(echo "$pcinfo" | sed -n 's/^head=//p')"
+
+    say "Collecting objects created on the remote"
+    rsync_remote -az "$HOST:$remote/.git/objects/" "$gcommon/objects/" \
+      || die "could not pull git objects"
+    ok "objects merged into $gcommon/objects (additive: nothing was removed)"
+
+    say "Syncing working files"
+    rsync_remote -az --delete "${EX[@]}" --exclude='.git' \
+      "$HOST:$remote/" "$ROOT/" >/dev/null || die "rsync from the remote failed (snapshot is intact)"
+    ok "working files are home"
+
+    [ -n "$gdir" ] && rsync_remote -az "$HOST:$remote/.git/index" "$gdir/index" 2>/dev/null \
+      && ok "staged state restored"
+
+    if [ -n "$head" ]; then
+      if [ -n "$branch" ] && [ "$branch" != "HEAD" ] && [ "$branch" != "DETACHED" ]; then
+        git -C "$ROOT" update-ref "refs/heads/$branch" "$head" \
+          && ok "branch $branch moved to $(echo "$head" | cut -c1-8)" \
+          || warn "could not move $branch to $head"
+      else
+        git -C "$ROOT" update-ref HEAD "$head" && ok "detached HEAD moved to $(echo "$head" | cut -c1-8)"
+      fi
+    fi
+  else
+    say "Syncing from the remote"
+    rsync_remote -az --delete "${EX[@]}" \
+      "$HOST:$remote/" "$ROOT/" >/dev/null || die "rsync from the remote failed (snapshot is intact)"
+    ok "files are home"
+  fi
+
+  rexec "tmux kill-session -t $sess 2>/dev/null; true" >/dev/null 2>&1
+  ok "remote session $sess stopped"
+  reg_del "$ROOT"
+  ok "$name is yours again"
+
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    echo; git -C "$ROOT" status --short --branch | head -20
+  fi
+  echo
+  echo "  The remote copy stays at $remote until the next handoff overwrites it."
+}
+
+cmd_status(){
+  need_config
+  py - "$REG" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+if not d:
+    print("nothing handed off")
+else:
+    for k,v in d.items():
+        print("%-44s -> %s:%s  [%s]  since %s" % (k, v.get("host"), v.get("remote"),
+                                                  v.get("session"), v.get("since")))
+PY
+  echo
+  if rexec "true" >/dev/null 2>&1; then
+    printf "%s%s: reachable%s\n" "$c_g" "$REMOTE_LABEL" "$c_0"
+    rexec "tmux ls 2>/dev/null | grep '^$SESSION_PREFIX' || echo '  (no handoff sessions running)'" 2>/dev/null | tr -d '\000\r'
+  else
+    printf "%s%s: unreachable%s\n" "$c_r" "$REMOTE_LABEL" "$c_0"
+  fi
+}
+
+cmd_attach(){
+  need_config
+  ROOT="$(project_root)"
+  local info sess
+  info="$(reg_get "$ROOT")"
+  [ -z "$info" ] && die "$(basename "$ROOT") is not handed off."
+  sess="$(reg_field "$info" session)"
+  if [ "$REMOTE_KIND" = "wsl" ]; then
+    exec ssh -t $SSH_OPTS "$HOST" "wsl -d $WSL_DISTRO -- bash -lc \"tmux attach -t $sess\""
+  else
+    exec ssh -t $SSH_OPTS "$HOST" "tmux attach -t $sess"
+  fi
+}
+
+cmd_port(){
+  need_config
+  local p="${1:-}" target="localhost"
+  [ -z "$p" ] && die "usage: handoff port <port>"
+  if [ "$REMOTE_KIND" = "wsl" ]; then
+    # WSL2 is behind its own NAT, so forwarding to the Windows loopback reaches
+    # nothing. Resolve the distro's address, which changes on every boot.
+    target="$(rexec "hostname -I" 2>/dev/null | tr -d '\000\r' | awk '{print $1}')"
+    [ -z "$target" ] && die "could not resolve the WSL address on $HOST"
+  fi
+  say "Forwarding localhost:$p -> $REMOTE_LABEL ($target):$p    Ctrl-C to stop"
+  echo "  Your dev server must bind 0.0.0.0, not 127.0.0.1, to be reachable."
+  exec ssh $SSH_OPTS -N -L "$p:$target:$p" "$HOST"
+}
+
+cmd_abort(){
+  need_config
+  ROOT="$(project_root)"
+  [ -z "$(reg_get "$ROOT")" ] && die "$(basename "$ROOT") is not handed off."
+  reg_del "$ROOT"
+  ok "lock cleared for $(basename "$ROOT"). The remote copy was left untouched."
+}
+
+# --- setup ----------------------------------------------------------------
+ask(){ # ask <prompt> <default> -> echoes answer
+  local prompt="$1" def="${2:-}" ans
+  if [ -n "$def" ]; then printf "  %s [%s]: " "$prompt" "$def" >&2
+  else printf "  %s: " "$prompt" >&2; fi
+  read -r ans </dev/tty
+  echo "${ans:-$def}"
+}
+
+# Where remote/ and hooks/ live: either a git checkout (../remote) or an
+# install tree ($PREFIX/share/handoff/remote).
+find_share_dir(){
+  local self bindir cand
+  self="${BASH_SOURCE[0]}"
+  while [ -L "$self" ]; do self="$(readlink "$self")"; done
+  bindir="$(cd "$(dirname "$self")" && pwd -P)"
+  for cand in "$bindir/.." "$bindir/../share/handoff" "$HOME/.local/share/handoff"; do
+    if [ -f "$cand/remote/handoff-remote" ] && [ -f "$cand/hooks/handoff-guard.py" ]; then
+      (cd "$cand" && pwd -P); return 0
+    fi
+  done
+  return 1
+}
+
+cmd_setup(){
+  local share_dir
+  share_dir="$(find_share_dir)" || die "cannot find remote/ and hooks/. Run install.sh, or run setup from a checkout."
+
+  say "handoff setup"
+  echo "  Point this at the machine you want to hand work off to."
+  echo
+  local host root kind distro label claude_bin
+  host="$(ask 'SSH target (user@host)' "${HANDOFF_HOST:-}")"
+  [ -z "$host" ] && die "an SSH target is required"
+  echo
+  echo "  Remote kind:"
+  echo "    plain - the SSH session lands in a normal Linux or macOS shell"
+  echo "    wsl   - it lands in Windows, and the work happens inside WSL"
+  kind="$(ask 'plain or wsl' "${HANDOFF_REMOTE_KIND:-plain}")"
+  distro="Ubuntu"
+  [ "$kind" = "wsl" ] && distro="$(ask 'WSL distro name' "${HANDOFF_WSL_DISTRO:-Ubuntu}")"
+  root="$(ask 'Directory for handed-off projects on the remote' "${HANDOFF_REMOTE_ROOT:-\$HOME/work}")"
+  label="$(ask 'Friendly name for it' "$(echo "$host" | sed 's/.*@//')")"
+  claude_bin="$(ask 'Path to claude on the remote' "${HANDOFF_CLAUDE_BIN:-\$HOME/.local/bin/claude}")"
+
+  HOST="$host"; REMOTE_KIND="$kind"; WSL_DISTRO="$distro"
+  REMOTE_LABEL="$label"; CLAUDE_BIN="$claude_bin"
+
+  # $HOME in the root must be expanded by the remote, not here.
+  REMOTE_ROOT="$(rexec "printf %s \\\"$root\\\"" 2>/dev/null | tr -d '\000\r')"
+  [ -z "$REMOTE_ROOT" ] && REMOTE_ROOT="$root"
+
+  mkdir -p "$(dirname "$CONFIG")" "$STATE_DIR" "$BACKUPS"
+  cat > "$CONFIG" <<EOF
+# handoff configuration. Regenerate with 'handoff setup'.
+HANDOFF_HOST="$HOST"
+HANDOFF_REMOTE_ROOT="$REMOTE_ROOT"
+HANDOFF_REMOTE_KIND="$REMOTE_KIND"
+HANDOFF_WSL_DISTRO="$WSL_DISTRO"
+HANDOFF_REMOTE_LABEL="$REMOTE_LABEL"
+HANDOFF_CLAUDE_BIN="$CLAUDE_BIN"
+HANDOFF_PERMISSION_MODE="${PERMISSION_MODE}"
+HANDOFF_SESSION_PREFIX="${SESSION_PREFIX}"
+EOF
+  ok "config written to $CONFIG"
+
+  say "Checking the connection"
+  rexec "true" >/dev/null 2>&1 || die "cannot reach $HOST. Fix SSH access, then rerun."
+  ok "$HOST answers"
+
+  say "Installing the remote helper"
+  rexec "mkdir -p \$HOME/.local/bin '$REMOTE_ROOT'" >/dev/null 2>&1
+  local helper="$share_dir/remote/handoff-remote"
+  [ -f "$helper" ] || die "cannot find $helper"
+  if [ "$REMOTE_KIND" = "wsl" ]; then
+    ssh $SSH_OPTS "$HOST" "wsl -d $WSL_DISTRO -- dd of=/tmp/handoff-remote status=none" < "$helper"
+  else
+    ssh $SSH_OPTS "$HOST" "cat > /tmp/handoff-remote" < "$helper"
+  fi
+  rexec "install -m 755 /tmp/handoff-remote \$HOME/.local/bin/handoff-remote" >/dev/null 2>&1 \
+    && ok "handoff-remote installed" || die "could not install the remote helper"
+
+  say "Checking what the remote has"
+  local missing=""
+  for b in git rsync tmux; do
+    rexec "command -v $b" >/dev/null 2>&1 || missing="$missing $b"
+  done
+  rexec "command -v claude || test -x $CLAUDE_BIN" >/dev/null 2>&1 || missing="$missing claude"
+  if [ -n "$missing" ]; then warn "missing on the remote:$missing"; else ok "git, rsync, tmux and claude are all there"; fi
+
+  say "Registering the Claude Code guard hook"
+  local guard="$HOME/.claude/scripts/handoff-guard.py"
+  mkdir -p "$HOME/.claude/scripts"
+  cp "$share_dir/hooks/handoff-guard.py" "$guard" && chmod +x "$guard"
+  py - "$HOME/.claude/settings.json" "$guard" <<'PY'
+import json,os,sys
+p,guard=sys.argv[1],sys.argv[2]
+try: s=json.load(open(p))
+except Exception: s={}
+h=s.setdefault("hooks",{}); pre=h.setdefault("PreToolUse",[])
+pre=[e for e in pre if "handoff-guard" not in json.dumps(e)]
+pre.append({"matcher":"Edit|Write|MultiEdit|NotebookEdit",
+            "hooks":[{"type":"command","command":guard}]})
+h["PreToolUse"]=pre
+os.makedirs(os.path.dirname(p),exist_ok=True)
+json.dump(s,open(p,"w"),indent=2)
+print("  hook registered in "+p)
+PY
+  ok "the guard is live"
+  echo
+  say "Done. Try: cd into a project, then 'handoff to remote'"
+  [ "$REMOTE_KIND" = "wsl" ] && {
+    echo
+    warn "WSL note: Windows shuts the distro down when nothing is running in it,"
+    warn "which kills detached tmux sessions. See README section 'Keeping WSL alive'."
+  }
+}
+
+cmd_doctor(){
+  local bad=0
+  say "Local"
+  [ -f "$CONFIG" ] && ok "config: $CONFIG" || { warn "no config, run 'handoff setup'"; bad=1; }
+  command -v rsync >/dev/null && ok "rsync: $(command -v rsync)" || { warn "rsync missing"; bad=1; }
+  command -v python3 >/dev/null && ok "python3: $(command -v python3)" || { warn "python3 missing"; bad=1; }
+  if grep -q handoff-guard "$HOME/.claude/settings.json" 2>/dev/null; then
+    ok "guard hook registered"
+  else warn "guard hook not registered in ~/.claude/settings.json"; bad=1; fi
+  [ -x "$HOME/.claude/scripts/handoff-guard.py" ] && ok "guard script present" || { warn "guard script missing"; bad=1; }
+
+  echo
+  say "Remote ($REMOTE_LABEL, kind=$REMOTE_KIND)"
+  if [ -z "$HOST" ]; then warn "no host configured"; return 1; fi
+  if rexec "true" >/dev/null 2>&1; then
+    ok "ssh to $HOST works"
+    local b
+    for b in git rsync tmux; do
+      rexec "command -v $b" >/dev/null 2>&1 && ok "$b present" || { warn "$b MISSING"; bad=1; }
+    done
+    rexec "test -x \$HOME/.local/bin/handoff-remote" >/dev/null 2>&1 \
+      && ok "handoff-remote installed" || { warn "handoff-remote missing, rerun setup"; bad=1; }
+    rexec "test -x $CLAUDE_BIN" >/dev/null 2>&1 \
+      && ok "claude at $CLAUDE_BIN" || { warn "claude not found at $CLAUDE_BIN"; bad=1; }
+    rexec "test -d '$REMOTE_ROOT'" >/dev/null 2>&1 \
+      && ok "remote root $REMOTE_ROOT exists" || warn "remote root $REMOTE_ROOT missing (created on first handoff)"
+  else
+    warn "cannot reach $HOST"; bad=1
+  fi
+  echo
+  [ $bad -eq 0 ] && ok "all good" || warn "some checks failed"
+  return $bad
+}
+
+usage(){ cat <<U
+handoff $VERSION - move a project to another machine and back
+
+  handoff setup             configure the remote and install everything
+  handoff doctor            check that both ends are healthy
+
+  handoff to remote         push this project and start Claude over there
+  handoff back              pull it home and stop the remote session
+  handoff status            what is out, and is the remote up
+  handoff attach            attach to the remote tmux session
+  handoff port <n>          forward a dev server port from the remote
+  handoff abort             release the lock without syncing back
+
+While a project is handed off, a Claude Code hook blocks Edit and Write on
+this machine so the stale copy cannot drift.
+
+Config: ${CONFIG}
+State:  ${STATE_DIR}
+U
+}
+
+case "${1:-}" in
+  to)      shift; case "${1:-}" in remote|pc|it) shift ;; esac; cmd_to "$@" ;;
+  back)    shift; cmd_back "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  attach)  shift; cmd_attach "$@" ;;
+  port)    shift; cmd_port "$@" ;;
+  abort)   shift; cmd_abort "$@" ;;
+  setup)   shift; cmd_setup "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  -v|--version) echo "handoff $VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command '$1' (try: handoff --help)" ;;
+esac
